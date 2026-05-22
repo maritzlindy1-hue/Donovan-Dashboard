@@ -3,7 +3,7 @@ from flask import Flask, render_template
 import pandas as pd
 from datetime import datetime
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="templates")
 
 EXCEL_FILE = "Donovan_JC_Live_Dashboard.xlsx"
 
