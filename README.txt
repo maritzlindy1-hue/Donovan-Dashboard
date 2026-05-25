@@ -1,7 +1,4 @@
-Donovan JC Dashboard v3
+Build Command: pip install -r requirements.txt
+Start Command: gunicorn app:app
 
-Render settings:
-Build command: pip install -r requirements.txt
-Start command: gunicorn app:app
-
-This version uses the updated afternoon export as the live dashboard and compares it to the morning export.
+Upload all files to GitHub with templates/index.html inside the templates folder.

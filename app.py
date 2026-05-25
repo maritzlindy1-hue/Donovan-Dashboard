@@ -4,8 +4,9 @@ import pandas as pd
 from datetime import datetime
 
 app = Flask(__name__, template_folder="templates")
-CURRENT_FILE = "Job Card List 202605221448.xlsx"
-MORNING_FILE = "Job Card List 202605220822.xlsx"
+EXCEL_FILE = "Donovan_JC_Live_Dashboard.xlsx"
+MORNING_BASELINE = 88
+PREVIOUS_UPDATE = 86
 
 
 def safe_str(val):
@@ -14,19 +15,17 @@ def safe_str(val):
     return str(val).strip()
 
 
-def load_raw(path):
-    df = pd.read_excel(path, sheet_name="Report Job Card List")
-    if "Assigned To" in df.columns:
-        df = df[df["Assigned To"].astype(str).str.contains("Donovan", case=False, na=False)]
-    if "Is Active" in df.columns:
-        df = df[df["Is Active"] == True]
-    return df.copy()
+def get_sheet():
+    xls = pd.ExcelFile(EXCEL_FILE)
+    if "Report Job Card List" in xls.sheet_names:
+        return "Report Job Card List"
+    return xls.sheet_names[0]
 
 
-def classify_commodity(job_type: str, desc: str = "", assets: str = ""):
-    text = f"{safe_str(job_type)} {safe_str(desc)} {safe_str(assets)}".lower()
-    has_water = any(x in text for x in ["water", "flowiq", "lora", "visio", "gateway"])
-    has_elec = any(x in text for x in ["elec", "elect", "kva", "omnipower", "modem", "kamstrup server meter"])
+def classify_commodity(job_type, desc="", materials="", assets=""):
+    text = f"{safe_str(job_type)} {safe_str(desc)} {safe_str(materials)} {safe_str(assets)}".lower()
+    has_water = any(x in text for x in ["water", "flowiq", "lora", "visio", "kamstrup flow"])
+    has_elec = any(x in text for x in ["elec", "electrical", "omnipower", "kva", "ct", "server meter"])
     if has_water and has_elec:
         return "Mixed"
     if has_water:
@@ -36,15 +35,34 @@ def classify_commodity(job_type: str, desc: str = "", assets: str = ""):
     return "Other"
 
 
-def simplify_status(status: str):
+def simplify_status(status):
     s = safe_str(status)
     if not s:
         return "Unknown"
+    if ">" in s:
+        s = s.split(">")[-1].strip()
     if "_" in s:
         parts = s.split("_", 2)
         if len(parts) >= 3:
             return parts[2].replace("/", " / ")
     return s
+
+
+def stage_group(status):
+    text = safe_str(status).lower()
+    if "troubleshoot" in text:
+        return "Remote Troubleshoot"
+    if "client feedback" in text:
+        return "Awaiting Client Feedback"
+    if "quote" in text:
+        return "Quote / Approval"
+    if "stock" in text:
+        return "Stock / Logistics"
+    if "schedule" in text or "install" in text or "commission" in text:
+        return "Install / Commission"
+    if "close" in text or "complete" in text:
+        return "Complete / Close"
+    return "Other Step"
 
 
 def derive_kpi_stage(days_overall):
@@ -73,102 +91,82 @@ def derive_priority(days_overall):
     return "Healthy"
 
 
-def derive_next_action(status, days_overall):
-    s = safe_str(status).lower()
-    try:
-        d = float(days_overall)
-    except Exception:
-        d = 0
-    if "troubleshoot" in s or "investigation" in s:
-        return "Troubleshoot remotely and add evidence/comment on JC"
-    if "awaiting client feedback" in s:
-        return "Follow up with client and record who was contacted + outcome"
-    if "quote" in s and "sent" in s:
-        return "Weekly quote follow-up; add call/email note to JC"
-    if "quote population" in s or "quote to approve" in s:
-        return "Push quote process / confirm hardware or call-out requirement"
-    if "schedule" in s:
-        return "Confirm installation/commissioning date and update JC"
-    if "install complete" in s or "sign off" in s:
-        return "Review install info, sign off or move to next department"
-    if "final invoice" in s:
-        return "Confirm final invoice/monthly check and close where applicable"
-    if d > 6:
-        return "Escalate / agree action plan with Lindy and update JC"
-    if d >= 4:
-        return "Call client today and add full JC comment"
-    return "Continue within Day 0-2 remote troubleshooting window"
+def load_data():
+    sheet = get_sheet()
+    raw = pd.read_excel(EXCEL_FILE, sheet_name=sheet)
+    raw.columns = [str(c).strip() for c in raw.columns]
 
+    if "Assigned To" in raw.columns:
+        raw = raw[raw["Assigned To"].astype(str).str.contains("Donovan", case=False, na=False)]
+    if "Is Active" in raw.columns:
+        raw = raw[raw["Is Active"].astype(str).str.lower().isin(["true", "yes", "1"])]
+    elif "Closed" in raw.columns:
+        raw = raw[~raw["Closed"].astype(str).str.lower().isin(["true", "yes", "1"])]
 
-def prepare(df):
-    df = df.copy()
-    for col in ["Customer", "Contact", "Email", "Mobile", "Job Number", "Job Type", "Description", "Customer Assets", "Job Status", "Modified Date"]:
-        if col not in df.columns:
-            df[col] = ""
-    df["Days Overall"] = pd.to_numeric(df.get("Days Overall", 0), errors="coerce").fillna(0)
-    df["Days In Status"] = pd.to_numeric(df.get("Days In Status", 0), errors="coerce").fillna(0)
-    df["Commodity"] = df.apply(lambda r: classify_commodity(r["Job Type"], r["Description"], r["Customer Assets"]), axis=1)
-    df["Step"] = df["Job Status"].apply(simplify_status)
-    df["KPI Stage"] = df["Days Overall"].apply(derive_kpi_stage)
-    df["Priority"] = df["Days Overall"].apply(derive_priority)
-    df["Next Required Action"] = df.apply(lambda r: derive_next_action(r["Job Status"], r["Days Overall"]), axis=1)
-    df["Modified Date"] = pd.to_datetime(df["Modified Date"], errors="coerce")
-    return df.sort_values(["Days Overall", "Days In Status"], ascending=[False, False])
+    raw = raw.copy()
+    for col in ["Job Number", "Customer", "Job Type", "Description", "Materials", "Customer Assets", "Contact", "Email", "Mobile", "Next Required Action", "Job Status", "Status Flow", "Serial No"]:
+        if col not in raw.columns:
+            raw[col] = ""
+    for col in ["Days Overall", "Days In Status"]:
+        if col not in raw.columns:
+            raw[col] = 0
+        raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0).astype(int)
 
-
-def compare_progress(morning, current):
-    m_ids = set(morning["Job Number"].astype(str))
-    c_ids = set(current["Job Number"].astype(str))
-    removed = sorted(list(m_ids - c_ids))
-    added = sorted(list(c_ids - m_ids))
-    return {
-        "morning_total": len(morning),
-        "current_total": len(current),
-        "net_change": len(current) - len(morning),
-        "removed_count": len(removed),
-        "added_count": len(added),
-        "removed": removed,
-        "added": added,
-        "note": f"Morning list: {len(morning)} tickets. Current list: {len(current)} tickets. Net improvement: {len(morning)-len(current)} fewer ticket(s). {len(removed)} ticket(s) moved off Donovan's active list today, while {len(added)} new ticket(s) were added."
-    }
+    raw["Commodity"] = raw.apply(lambda r: classify_commodity(r["Job Type"], r["Description"], r["Materials"], r["Customer Assets"]), axis=1)
+    raw["Step"] = raw["Job Status"].apply(simplify_status)
+    raw["Stage Group"] = raw["Job Status"].apply(stage_group)
+    raw["KPI Stage"] = raw["Days Overall"].apply(derive_kpi_stage)
+    raw["Priority"] = raw["Days Overall"].apply(derive_priority)
+    raw["Next Required Action"] = raw["Next Required Action"].replace("", "Review JC and update next action")
+    if "Modified Date" not in raw.columns:
+        raw["Modified Date"] = ""
+    raw["Modified Date"] = pd.to_datetime(raw["Modified Date"], errors="coerce")
+    raw = raw.sort_values(["Days Overall", "Days In Status"], ascending=[False, False])
+    return raw
 
 
 @app.route("/")
 def dashboard():
-    morning = prepare(load_raw(MORNING_FILE))
-    df = prepare(load_raw(CURRENT_FILE))
-    progress = compare_progress(morning, df)
-
+    df = load_data()
     total = len(df)
     critical = int((df["Priority"] == "Critical").sum())
     warning = int((df["Priority"] == "Warning").sum())
     healthy = int((df["Priority"] == "Healthy").sum())
     avg_age = round(df["Days Overall"].mean(), 1) if total else 0
-    stuck = int((df["Days In Status"] >= 7).sum())
+    closed_since_morning = max(MORNING_BASELINE - total, 0)
+    change_since_previous = PREVIOUS_UPDATE - total
 
-    status_counts = df["Step"].value_counts().head(12)
-    kpi_counts = df["KPI Stage"].value_counts()
-    commodity_counts = df["Commodity"].value_counts()
-    priority_counts = df["Priority"].value_counts()
+    def counts(col, top=None):
+        vc = df[col].value_counts()
+        if top:
+            vc = vc.head(top)
+        return list(vc.index), [int(v) for v in vc.values]
 
-    top_overdue_df = df[["Job Number", "Customer", "Commodity", "Job Type", "Step", "Days Overall", "Days In Status", "Next Required Action", "Contact", "Email", "Mobile"]].head(20).copy()
-    tickets_df = df[["Job Number", "Customer", "Commodity", "Job Type", "Step", "Days Overall", "Days In Status", "KPI Stage", "Priority", "Next Required Action", "Contact", "Email", "Mobile", "Description", "Modified Date"]].copy()
-    tickets_df["Modified Date"] = tickets_df["Modified Date"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    status_labels, status_values = counts("Step", 10)
+    stage_labels, stage_values = counts("Stage Group")
+    kpi_labels, kpi_values = counts("KPI Stage")
+    commodity_labels, commodity_values = counts("Commodity")
+    priority_labels, priority_values = counts("Priority")
+
+    cols = ["Job Number", "Customer", "Commodity", "Job Type", "Step", "Stage Group", "Days Overall", "Days In Status", "KPI Stage", "Priority", "Next Required Action", "Contact", "Email", "Mobile", "Serial No", "Description", "Modified Date"]
+    tickets = df[cols].copy()
+    tickets["Modified Date"] = tickets["Modified Date"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    top_overdue = tickets.head(20).to_dict(orient="records")
+    tickets = tickets.to_dict(orient="records")
 
     chart_data = {
-        "status_labels": list(status_counts.index),
-        "status_values": [int(v) for v in status_counts.values],
-        "kpi_labels": list(kpi_counts.index),
-        "kpi_values": [int(v) for v in kpi_counts.values],
-        "commodity_labels": list(commodity_counts.index),
-        "commodity_values": [int(v) for v in commodity_counts.values],
-        "priority_labels": list(priority_counts.index),
-        "priority_values": [int(v) for v in priority_counts.values],
-        "progress_labels": ["Morning", "Now"],
-        "progress_values": [progress["morning_total"], progress["current_total"]],
+        "status_labels": status_labels, "status_values": status_values,
+        "stage_labels": stage_labels, "stage_values": stage_values,
+        "kpi_labels": kpi_labels, "kpi_values": kpi_values,
+        "commodity_labels": commodity_labels, "commodity_values": commodity_values,
+        "priority_labels": priority_labels, "priority_values": priority_values,
     }
 
-    return render_template("index.html", total=total, critical=critical, warning=warning, healthy=healthy, avg_age=avg_age, stuck=stuck, updated=datetime.now().strftime("%Y-%m-%d %H:%M"), progress=progress, top_overdue=top_overdue_df.to_dict(orient="records"), tickets=tickets_df.to_dict(orient="records"), chart_data=chart_data)
+    return render_template("index.html", total=total, critical=critical, warning=warning, healthy=healthy,
+        avg_age=avg_age, updated=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        morning_baseline=MORNING_BASELINE, previous_update=PREVIOUS_UPDATE,
+        closed_since_morning=closed_since_morning, change_since_previous=change_since_previous,
+        top_overdue=top_overdue, tickets=tickets, chart_data=chart_data)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
